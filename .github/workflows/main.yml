@@ -1,0 +1,68 @@
+name: Perpetual Persistent Runner
+on: 
+  push:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [restart-runner] # Custom trigger for the loop
+
+permissions:
+  contents: write
+  actions: write # Required to trigger the next workflow run
+
+jobs:
+  environment:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reassemble Chunked Files
+        run: |
+          # Import: Finds .part_aa files and merges them back into the original
+          find . -name "*.part_aa" | while read part_aa; do
+            base_file="${part_aa%.part_aa}"
+            echo "Reassembling $base_file..."
+            cat "${base_file}.part_"* > "$base_file"
+            rm "${base_file}.part_"*
+          done
+
+      - name: Install and Up Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --ssh --hostname=gh-ultra-node
+
+      - name: Prepare Workspace
+        run: |
+          rm -f .gitignore
+          echo "Access via: tailscale ssh runner@gh-ultra-node"
+
+      - name: Active Session
+        # Set to ~5 hours to ensure we have time to sync and restart before the 6h hard limit
+        run: sleep 18000 
+
+      - name: Deep Sync, Re-Chunk, and Restart
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          # 1. Export: Chunk files > 90MB for the 100MB limit
+          find . -type f -size +90M -not -path '*/.git/*' -exec split -b 90M {} {}.part_ \; -exec rm {} \;
+
+          # 2. Force Sync everything to Repo
+          git add -A --force
+          if ! git diff --cached --quiet; then
+            git commit -m "Auto-Sync: $(date +'%Y-%m-%d %H:%M:%S')"
+            git push origin HEAD:${{ github.ref }} --force
+          fi
+
+          # 3. TRIGGER RESTART: Send a dispatch to start a new runner immediately
+          echo "Triggering recursive restart..."
+          curl -X POST -H "Authorization: Bearer $GH_TOKEN" \
+               -H "Accept: application/vnd.github.v3+json" \
+               https://api.github.com/repos/${{ github.repository }}/dispatches \
+               -d '{"event_type": "restart-runner"}'
