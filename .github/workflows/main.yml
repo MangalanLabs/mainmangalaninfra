@@ -1,34 +1,67 @@
-- name: Backup, Chunk, and Restart
+name: Perpetual Total System Runner
+on: 
+  push:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [restart-runner]
+
+permissions:
+  contents: write
+  actions: write 
+
+jobs:
+  terminal-session:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Import and Restore System
+        run: |
+          if ls system_backup.tar.gz.part_* 1> /dev/null 2>&1; then
+            echo "Reassembling system backup..."
+            cat system_backup.tar.gz.part_* > system_backup.tar.gz
+            echo "Restoring system state to root..."
+            sudo tar -xzf system_backup.tar.gz -C / --overwrite || true
+            rm system_backup.tar.gz
+          else
+            echo "No previous system backup found."
+          fi
+
+      - name: Install and Up Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --ssh --hostname=gh-ultra-node
+
+      - name: Active Session
+        run: sleep 18000 || true 
+
+      - name: Backup, Chunk, and Restart
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # Increase Git buffer for large chunk pushes
           git config --global http.postBuffer 524288000
 
-          echo "Cleaning system to save space..."
+          echo "Cleaning and Zipping..."
           sudo apt-get clean && sudo rm -rf /var/lib/apt/lists/*
-
-          echo "Zipping (Optimized)..."
-          # Exclude heavy folders that aren't 'your' data to keep the zip small
+          
           sudo tar -czf system_backup.tar.gz / \
             --exclude=/system_backup.tar.gz \
             --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run \
             --exclude=/boot --exclude=/var/cache --exclude=/var/log \
-            --exclude=/usr/share/doc --exclude=/usr/share/man \
             --exclude=${{ github.workspace }} \
             --one-file-system 2> /dev/null || true
 
-          echo "Chunking..."
+          echo "Chunking and Pushing..."
           split -b 90M system_backup.tar.gz system_backup.tar.gz.part_
           rm system_backup.tar.gz
 
-          echo "Pushing to GitHub..."
           git add system_backup.tar.gz.part_*
           if ! git diff --cached --quiet; then
-            git commit -m "Full System State: $(date +'%Y-%m-%d %H:%M:%S')"
+            git commit -m "Total System Sync: $(date +'%Y-%m-%d %H:%M:%S')"
             git push origin HEAD:${{ github.ref }} --force
           fi
 
