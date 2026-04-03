@@ -1,3 +1,9 @@
+# This workflow is a self-restarting loop designed to maintain a persistent session.
+# Key Fixes:
+# 1. Tailscale nodes are now ephemeral to prevent cluttering your tailnet.
+# 2. A delay has been added before restarting to fix a race condition, ensuring
+#    the new state is successfully checked out by the next run.
+
 name: Persistent Runner Loop
 
 on:
@@ -7,7 +13,9 @@ on:
     types: [restart-runner]
 
 permissions:
+  # Required to push the state file back to the repository
   contents: write
+  # Required to dispatch the next workflow run
   actions: write
 
 jobs:
@@ -15,75 +23,92 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
+        # We fetch extra history to avoid issues with shallow clones on push
+        with:
+          fetch-depth: 0
 
-      # Restore small state only
       - name: Restore State
         run: |
           if [ -f state.tar.gz ]; then
-            echo "Restoring state..."
-            tar -xzf state.tar.gz || true
+            echo "Restoring state from state.tar.gz..."
+            # The 'state' directory will be created upon extraction
+            tar -xzf state.tar.gz
+            # Optional: Display the restored state for debugging
+            cat state/last_run.txt
           else
-            echo "No state found"
+            echo "No state file found. This must be the first run."
           fi
 
-      # Optional: your tool setup (safe)
       - name: Setup Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --ssh --hostname=gh-node || true
+          # FIX: --ephemeral flag cleans up the node after it disconnects.
+          # FIX: Unique hostname prevents conflicts and helps identify the node.
+          sudo tailscale up \
+            --authkey=${{ secrets.TAILSCALE_AUTHKEY }} \
+            --hostname=gh-runner-${{ github.run_id }} \
+            --ssh \
+            --ephemeral
 
-      # Your "active session"
-      - name: Active Session
+      - name: Active Session (Your Main Task)
         run: |
-          echo "Running..."
-          sleep 1800   # 30 min (safe vs 5h kill risk)
+          echo "This workflow run started at $(date)."
+          echo "Previous run was at: $(cat state/last_run.txt || echo 'N/A')"
+          echo "Simulating a 30-minute task..."
+          sleep 1800 # 30 min
 
-      # Save minimal state only
       - name: Save State
+        # always() ensures this step runs even if the previous one fails
         if: always()
         run: |
+          echo "Saving current state..."
           mkdir -p state
-          
-          # Example state (customize this)
-          echo "$(date)" > state/last_run.txt
-
+          # This is where you save your important files.
+          # For this example, we just save the timestamp.
+          echo "State saved at $(date)" > state/last_run.txt
           tar -czf state.tar.gz state
 
-      # Commit safely (only if changed)
-      - name: Commit State
+      - name: Commit and Push State
         if: always()
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
+          
           git add state.tar.gz
-
+          
+          # Commit only if there are changes to the state file
           if ! git diff --cached --quiet; then
-            git commit -m "State update: $(date +'%Y-%m-%d %H:%M:%S')"
+            git commit -m "chore: Update runner state for run ${{ github.run_id }}"
+            
+            # Retry pushing to handle transient network errors
+            for i in 1 2 3; do
+              git push && break
+              echo "Push failed. Retrying in 5 seconds... (Attempt $i)"
+              sleep 5
+            done
           else
-            echo "No changes"
+            echo "No state changes to commit."
           fi
 
-      # Push with retry (prevents random failure)
-      - name: Push Changes
-        if: always()
-        run: |
-          for i in 1 2 3; do
-            git push origin HEAD:${{ github.ref }} && break
-            echo "Retry $i..."
-            sleep 5
-          done
-
-      # Restart loop
-      - name: Restart Runner
+      - name: Restart Runner Loop
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
-          curl -X POST \
+          echo "Preparing to restart the workflow..."
+          
+          # FIX: Wait 15 seconds to prevent a race condition.
+          # This gives GitHub enough time to process the push before the new
+          # workflow starts and checks out the repository.
+          echo "Waiting for 15 seconds to allow git push to propagate..."
+          sleep 15
+          
+          echo "Dispatching 'restart-runner' event to trigger the next run."
+          curl --fail -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/dispatches \
+            https://api.github.com/repos/$REPO/dispatches \
             -d '{"event_type": "restart-runner"}'
