@@ -33,16 +33,30 @@ jobs:
       - name: Find project directory
         id: find-project
         run: |
-          # Search for chapati_mv_final.py in the repo
-          PROJECT_DIR=$(find . -name "chapati_mv_final.py" -type f | head -1 | xargs dirname)
+          echo "=== Directory structure ==="
+          ls -la
+          echo ""
+
+          PROJECT_DIR=""
+          if [ -f "chapati_mv_final.py" ]; then
+            PROJECT_DIR="."
+          elif [ -d "XTRAIN" ] && [ -f "XTRAIN/chapati_mv_final.py" ]; then
+            PROJECT_DIR="XTRAIN"
+          else
+            FOUND=$(find . -name "chapati_mv_final.py" -type f 2>/dev/null | head -1)
+            if [ -n "$FOUND" ]; then
+              PROJECT_DIR=$(dirname "$FOUND")
+              PROJECT_DIR=${PROJECT_DIR#./}
+            fi
+          fi
+
           if [ -z "$PROJECT_DIR" ]; then
-            echo "ERROR: chapati_mv_final.py not found in repository!"
-            echo "Directory structure:"
-            find . -type f -name "*.py" | head -20
+            echo "ERROR: chapati_mv_final.py not found!"
+            echo "Full tree:"
+            find . -type f | head -50
             exit 1
           fi
-          # Remove leading ./
-          PROJECT_DIR=${PROJECT_DIR#./}
+
           echo "project_dir=$PROJECT_DIR" >> $GITHUB_OUTPUT
           echo "Found project in: $PROJECT_DIR"
 
